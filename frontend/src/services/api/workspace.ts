@@ -1,6 +1,12 @@
 import axios from './axios'
 import { createEventStream } from './utils/stream'
 
+/** 镜像拉取 SSE 消息结构 */
+export type ImagePullMessage =
+  | { type: 'progress'; layer: string; status: string }
+  | { type: 'done'; data: string }
+  | { type: 'error'; data: string }
+
 export interface WorkspaceSummary {
   id: number
   name: string
@@ -13,6 +19,13 @@ export interface WorkspaceSummary {
   runtime_policy: 'agent' | 'relaxed' | 'strict'
   create_time: string
   update_time: string
+  // 聚合信息
+  channel_count: number
+  channel_names: string[]          // chat_key 列表
+  channel_display_names: string[]  // 频道显示名（channel_name 或 fallback 到 chat_key）
+  skill_count: number
+  mcp_count: number
+  cc_model_preset_name: string | null
 }
 
 export interface WorkspaceDetail extends WorkspaceSummary {
@@ -21,6 +34,7 @@ export interface WorkspaceDetail extends WorkspaceSummary {
   last_error: string | null
   metadata: Record<string, unknown>
   cc_model_preset_id?: number | null
+  primary_channel_chat_key?: string | null
 }
 
 export interface SandboxStatus {
@@ -45,7 +59,8 @@ export interface AllSkillItem {
   name: string
   display_name: string
   description: string
-  source: 'builtin' | 'user'
+  source: 'builtin' | 'user' | 'repo'
+  repo_name?: string | null
 }
 
 export interface AllSkillsResponse {
@@ -60,6 +75,14 @@ export interface SkillListResponse {
 
 export interface BoundChannel {
   chat_key: string
+  description: string
+  is_primary: boolean
+}
+
+export interface ChannelAnnotationUpdateBody {
+  chat_key: string
+  description: string
+  is_primary: boolean
 }
 
 export interface CreateWorkspaceBody {
@@ -118,8 +141,8 @@ export const workspaceApi = {
 
   // 频道绑定
   getBoundChannels: async (id: number): Promise<BoundChannel[]> => {
-    const response = await axios.get<{ channels: string[] }>(`/workspaces/${id}/channels`)
-    return response.data.channels.map(ch => ({ chat_key: ch }))
+    const response = await axios.get<{ channels: BoundChannel[] }>(`/workspaces/${id}/channels`)
+    return response.data.channels
   },
 
   bindChannel: async (id: number, chatKey: string): Promise<void> => {
@@ -128,6 +151,10 @@ export const workspaceApi = {
 
   unbindChannel: async (id: number, chatKey: string): Promise<void> => {
     await axios.delete(`/workspaces/${id}/channels/${chatKey}`)
+  },
+
+  updateChannelAnnotation: async (id: number, body: ChannelAnnotationUpdateBody): Promise<void> => {
+    await axios.put(`/workspaces/${id}/channel-annotations`, body)
   },
 
   // 沙盒操作
@@ -150,6 +177,30 @@ export const workspaceApi = {
   getSandboxStatus: async (id: number): Promise<SandboxStatus> => {
     const response = await axios.get<SandboxStatus>(`/workspaces/${id}/sandbox/status`)
     return response.data
+  },
+
+  checkSandboxImage: async (id: number): Promise<{ image: string; exists: boolean }> => {
+    const response = await axios.get<{ image: string; exists: boolean }>(`/workspaces/${id}/sandbox/image/check`)
+    return response.data
+  },
+
+  streamPullSandboxImage: (
+    id: number,
+    onMessage: (msg: ImagePullMessage) => void,
+    onError?: (err: Error) => void,
+  ): (() => void) => {
+    return createEventStream({
+      endpoint: `/workspaces/${id}/sandbox/image/pull/stream`,
+      method: 'POST',
+      onMessage: (raw) => {
+        try {
+          onMessage(JSON.parse(raw) as ImagePullMessage)
+        } catch {
+          onMessage({ type: 'progress', layer: '', status: raw })
+        }
+      },
+      onError,
+    })
   },
 
   getSandboxLogs: async (id: number, tail: number = 100): Promise<string> => {
@@ -251,6 +302,13 @@ export interface SkillTreeResponse {
   nodes: SkillTreeNode[]
 }
 
+export interface SkillDirEntry {
+  name: string
+  rel_path: string
+  type: 'file' | 'dir'
+  size: number | null
+}
+
 export const skillsLibraryApi = {
   getTree: async (): Promise<SkillTreeNode[]> => {
     const response = await axios.get<SkillTreeResponse>('/skills/tree')
@@ -302,6 +360,62 @@ export const skillsLibraryApi = {
     const response = await axios.get<{ readme: string }>(`/skills/${name}/readme`)
     return response.data.readme
   },
+
+  getAutoInject: async (): Promise<string[]> => {
+    const response = await axios.get<{ skills: string[] }>('/skills/auto-inject')
+    return response.data.skills
+  },
+
+  setAutoInject: async (skills: string[]): Promise<void> => {
+    await axios.put('/skills/auto-inject', { skills })
+  },
+
+  getDir: async (name: string, source: 'builtin' | 'user' | 'repo' = 'user'): Promise<SkillDirEntry[]> => {
+    const response = await axios.get<{ entries: SkillDirEntry[] }>('/skills/dir', {
+      params: { name, source },
+    })
+    return response.data.entries
+  },
+
+  saveFile: async (path: string, content: string): Promise<void> => {
+    await axios.put('/skills/file', { path, content })
+  },
+
+  syncToWorkspaces: async (skillId: string): Promise<{ synced_count: number }> => {
+    const response = await axios.post<{ ok: boolean; synced_count: number }>('/skills/sync-to-workspaces', {
+      skill_id: skillId,
+    })
+    return response.data
+  },
+}
+
+// 仓库订阅 API
+export interface RepoMeta {
+  repo_name: string
+  repo_url: string | null
+  repo_branch: string | null
+  subscribed_at: string | null
+  skill_count: number
+}
+
+export const repoApi = {
+  list: async (): Promise<RepoMeta[]> => {
+    const response = await axios.get<{ repos: RepoMeta[] }>('/skills/repos')
+    return response.data.repos
+  },
+
+  subscribe: async (repoUrl: string, repoName: string): Promise<void> => {
+    await axios.post('/skills/repos/subscribe', { repo_url: repoUrl, repo_name: repoName })
+  },
+
+  pull: async (repoName: string): Promise<string> => {
+    const response = await axios.post<{ ok: boolean; output: string }>(`/skills/repos/${encodeURIComponent(repoName)}/pull`)
+    return response.data.output
+  },
+
+  unsubscribe: async (repoName: string): Promise<void> => {
+    await axios.delete(`/skills/repos/${encodeURIComponent(repoName)}`)
+  },
 }
 
 // 动态 Skill API（工作区级）
@@ -319,6 +433,13 @@ export interface DynamicSkillListResponse {
 export interface DynamicSkillContent {
   dir_name: string
   content: string
+}
+
+export interface DynamicSkillDirEntry {
+  name: string
+  rel_path: string
+  type: 'file' | 'dir'
+  size?: number | null
 }
 
 export const dynamicSkillApi = {
@@ -340,8 +461,24 @@ export const dynamicSkillApi = {
     await axios.delete(`/workspaces/${workspaceId}/dynamic-skills/${dirName}`)
   },
 
-  promote: async (workspaceId: number, dirName: string): Promise<void> => {
-    await axios.post(`/workspaces/${workspaceId}/dynamic-skills/${dirName}/promote`)
+  promote: async (workspaceId: number, dirName: string, force = false): Promise<void> => {
+    await axios.post(`/workspaces/${workspaceId}/dynamic-skills/${dirName}/promote`, { force })
+  },
+
+  getDir: async (workspaceId: number, dirName: string): Promise<DynamicSkillDirEntry[]> => {
+    const response = await axios.get<{ entries: DynamicSkillDirEntry[] }>(`/workspaces/${workspaceId}/dynamic-skills/${dirName}/dir`)
+    return response.data.entries
+  },
+
+  getFile: async (workspaceId: number, dirName: string, relPath: string): Promise<string> => {
+    const response = await axios.get<DynamicSkillContent>(`/workspaces/${workspaceId}/dynamic-skills/${dirName}/file`, {
+      params: { rel_path: relPath },
+    })
+    return response.data.content
+  },
+
+  saveFile: async (workspaceId: number, dirName: string, relPath: string, content: string): Promise<void> => {
+    await axios.put(`/workspaces/${workspaceId}/dynamic-skills/${dirName}/file`, { rel_path: relPath, content })
   },
 }
 
@@ -360,6 +497,13 @@ export const builtinSkillApi = {
   getDoc: async (name: string, filename: string): Promise<string> => {
     const response = await axios.get<{ readme: string }>(`/skills/builtin/${name}/doc`, {
       params: { filename },
+    })
+    return response.data.readme
+  },
+
+  getFile: async (name: string, path: string): Promise<string> => {
+    const response = await axios.get<{ readme: string }>(`/skills/builtin/${name}/file`, {
+      params: { path },
     })
     return response.data.readme
   },

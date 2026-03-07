@@ -7,10 +7,10 @@ import struct
 import subprocess
 import termios
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
 
 import aiodocker
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -24,6 +24,9 @@ from nekro_agent.schemas.errors import (
     ValidationError,
 )
 from nekro_agent.schemas.workspace import (
+    BoundChannelInfo,
+    BoundChannelsResponse,
+    ChannelAnnotationUpdate,
     ChannelBindRequest,
     ClaudeMdExtraUpdate,
     ClaudeMdResponse,
@@ -42,10 +45,11 @@ from nekro_agent.schemas.workspace import (
     WorkspaceSummary,
     WorkspaceUpdate,
 )
+from nekro_agent.services.system_broadcast import WorkspaceStatusEvent, publish_system_event
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.workspace.client import CCSandboxClient, CCSandboxError
-from nekro_agent.services.workspace.container import SandboxContainerManager
+from nekro_agent.services.workspace.container import ImageNotFoundError, SandboxContainerManager
 from nekro_agent.services.workspace.manager import WorkspaceService
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
@@ -82,9 +86,32 @@ class McpConfigUpdate(BaseModel):
 # ─────────────────────────────────────────────────────────────
 
 
-def _summary(ws: DBWorkspace) -> WorkspaceSummary:
+def _summary(
+    ws: DBWorkspace,
+    *,
+    channel_names: "List[str] | None" = None,
+    channel_display_names: "List[str] | None" = None,
+) -> WorkspaceSummary:
+    from nekro_agent.core.cc_model_presets import cc_presets_store
     from nekro_agent.core.config import config as app_config
 
+    metadata = ws.metadata or {}
+    skill_count = len(metadata.get("skills", []))
+    mcp_count = len((metadata.get("mcp_config") or {}).get("mcpServers", {}))
+
+    preset_name: Optional[str] = None
+    preset_id = metadata.get("cc_model_preset_id")
+    if preset_id is not None:
+        preset = cc_presets_store.get_by_id(int(preset_id))
+        if preset:
+            preset_name = preset.name
+    if preset_name is None:
+        default = cc_presets_store.get_default()
+        if default:
+            preset_name = default.name
+
+    channels = channel_names or []
+    display_names = channel_display_names or channels  # fallback 到 chat_key
     return WorkspaceSummary(
         id=ws.id,
         name=ws.name,
@@ -97,10 +124,22 @@ def _summary(ws: DBWorkspace) -> WorkspaceSummary:
         runtime_policy=ws.runtime_policy,
         create_time=ws.create_time.strftime("%Y-%m-%d %H:%M:%S"),
         update_time=ws.update_time.strftime("%Y-%m-%d %H:%M:%S"),
+        channel_count=len(channels),
+        channel_names=channels[:2],
+        channel_display_names=display_names[:2],
+        skill_count=skill_count,
+        mcp_count=mcp_count,
+        cc_model_preset_name=preset_name,
     )
 
 
-def _detail(ws: DBWorkspace) -> WorkspaceDetail:
+async def _detail_async(ws: DBWorkspace) -> WorkspaceDetail:
+    """异步版本的 _detail，自动查询绑定频道以填充 primary_channel_chat_key。"""
+    channels = await WorkspaceService.get_bound_channels(ws.id)
+    return _detail(ws, bound_chat_keys=[ch.chat_key for ch in channels])
+
+
+def _detail(ws: DBWorkspace, *, bound_chat_keys: "List[str] | None" = None) -> WorkspaceDetail:
     from nekro_agent.core.cc_model_presets import cc_presets_store
 
     base = _summary(ws)
@@ -109,6 +148,7 @@ def _detail(ws: DBWorkspace) -> WorkspaceDetail:
         default = cc_presets_store.get_default()
         if default:
             cc_model_preset_id = default.id
+    primary_channel_chat_key = WorkspaceService.get_primary_channel_chat_key(ws, bound_chat_keys or [])
     return WorkspaceDetail(
         **base.model_dump(),
         container_id=ws.container_id,
@@ -116,6 +156,7 @@ def _detail(ws: DBWorkspace) -> WorkspaceDetail:
         last_error=ws.last_error,
         metadata=dict(ws.metadata),
         cc_model_preset_id=int(cc_model_preset_id) if cc_model_preset_id is not None else None,
+        primary_channel_chat_key=primary_channel_chat_key,
     )
 
 
@@ -138,12 +179,40 @@ async def list_workspaces(
     search: Optional[str] = None,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> WorkspaceListResponse:
+    from nekro_agent.models.db_chat_channel import DBChatChannel
+
     query = DBWorkspace.all()
     if search:
         query = query.filter(name__contains=search)
     total = await query.count()
     workspaces = await query.offset((page - 1) * page_size).limit(page_size).order_by("-update_time")
-    return WorkspaceListResponse(total=total, items=[_summary(ws) for ws in workspaces])
+
+    # 批量查询频道绑定（避免 N+1 查询），同时取 channel_name 用于显示
+    ws_ids = [ws.id for ws in workspaces]
+    channels_all = await DBChatChannel.filter(workspace_id__in=ws_ids).values(
+        "workspace_id", "chat_key", "channel_name"
+    )
+    channels_by_ws: Dict[int, List[str]] = {}
+    display_by_ws: Dict[int, List[str]] = {}
+    for ch in channels_all:
+        wid: int = ch["workspace_id"]
+        chat_key: str = ch["chat_key"]
+        # 优先使用 channel_name，无则 fallback 到 chat_key
+        display: str = ch.get("channel_name") or chat_key
+        channels_by_ws.setdefault(wid, []).append(chat_key)
+        display_by_ws.setdefault(wid, []).append(display)
+
+    return WorkspaceListResponse(
+        total=total,
+        items=[
+            _summary(
+                ws,
+                channel_names=channels_by_ws.get(ws.id, []),
+                channel_display_names=display_by_ws.get(ws.id, []),
+            )
+            for ws in workspaces
+        ],
+    )
 
 
 @router.post("", summary="创建工作区", response_model=WorkspaceDetail)
@@ -162,7 +231,20 @@ async def create_workspace(
         runtime_policy=body.runtime_policy,
     )
 
-    return _detail(ws)
+    # 自动注入默认技能
+    from nekro_agent.core.auto_inject_skills import get_auto_inject_skills
+
+    auto_skills = get_auto_inject_skills()
+    if auto_skills:
+        valid_skills = [s["name"] for s in WorkspaceService.list_all_skills()]
+        injected = [name for name in auto_skills if name in valid_skills]
+        if injected:
+            metadata = ws.metadata or {}
+            metadata["skills"] = injected
+            ws.metadata = metadata
+            await ws.save(update_fields=["metadata"])
+
+    return await _detail_async(ws)
 
 
 @router.get("/{workspace_id}", summary="获取工作区详情", response_model=WorkspaceDetail)
@@ -174,7 +256,7 @@ async def get_workspace(
     ws = await DBWorkspace.get_or_none(id=workspace_id)
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
-    return _detail(ws)
+    return await _detail_async(ws)
 
 
 @router.patch("/{workspace_id}", summary="更新工作区", response_model=WorkspaceDetail)
@@ -212,7 +294,7 @@ async def update_workspace(
     # 若 runtime_policy 更新，即时刷新 CLAUDE.md（bind mount 无需重建容器）
     if "runtime_policy" in update_fields:
         WorkspaceService.update_claude_md(ws)
-    return _detail(ws)
+    return await _detail_async(ws)
 
 
 @router.delete("/{workspace_id}", summary="删除工作区", response_model=ActionOkResponse)
@@ -237,17 +319,49 @@ async def delete_workspace(
 # ─────────────────────────────────────────────────────────────
 
 
-@router.get("/{workspace_id}/channels", summary="获取已绑定频道", response_model=ChannelListResponse)
+@router.get("/{workspace_id}/channels", summary="获取已绑定频道", response_model=BoundChannelsResponse)
 @require_role(Role.Admin)
 async def get_bound_channels(
     workspace_id: int,
     _current_user: DBUser = Depends(get_current_active_user),
-) -> ChannelListResponse:
+) -> BoundChannelsResponse:
     ws = await DBWorkspace.get_or_none(id=workspace_id)
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
     channels = await WorkspaceService.get_bound_channels(workspace_id)
-    return ChannelListResponse(channels=[ch.chat_key for ch in channels])
+    annotations = WorkspaceService.get_channel_annotations(ws)
+    bound_chat_keys = [ch.chat_key for ch in channels]
+    primary_key = WorkspaceService.get_primary_channel_chat_key(ws, bound_chat_keys)
+    items: List[BoundChannelInfo] = []
+    for ch in channels:
+        ann = annotations.get(ch.chat_key)
+        items.append(BoundChannelInfo(
+            chat_key=ch.chat_key,
+            description=ann.description if ann else "",
+            is_primary=(ch.chat_key == primary_key),
+        ))
+    return BoundChannelsResponse(channels=items)
+
+
+@router.put("/{workspace_id}/channel-annotations", summary="更新频道注解", response_model=ActionOkResponse)
+@require_role(Role.Admin)
+async def update_channel_annotation(
+    workspace_id: int,
+    body: ChannelAnnotationUpdate,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ActionOkResponse:
+    ws = await DBWorkspace.get_or_none(id=workspace_id)
+    if not ws:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    # 验证 chat_key 确实绑定到此工作区
+    channels = await WorkspaceService.get_bound_channels(workspace_id)
+    bound_keys = {ch.chat_key for ch in channels}
+    if body.chat_key not in bound_keys:
+        from nekro_agent.schemas.errors import ValidationError as AppValidationError
+
+        raise AppValidationError(reason=f"频道 {body.chat_key} 未绑定到此工作区")
+    await WorkspaceService.update_channel_annotation(ws, body.chat_key, body.description, body.is_primary)
+    return ActionOkResponse(ok=True)
 
 
 @router.post("/{workspace_id}/channels", summary="绑定频道到工作区", response_model=ActionOkResponse)
@@ -278,7 +392,7 @@ async def unbind_channel(
     ws = await DBWorkspace.get_or_none(id=workspace_id)
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
-    await WorkspaceService.unbind_channel(chat_key)
+    await WorkspaceService.unbind_channel(ws, chat_key)
     return ActionOkResponse(ok=True)
 
 
@@ -298,8 +412,18 @@ async def start_sandbox(
         raise NotFoundError(resource=f"工作区 {workspace_id}")
     if ws.status == "active":
         raise ValidationError(reason="工作区容器已在运行中")
-    ws = await SandboxContainerManager.create_and_start(ws)
-    return _detail(ws)
+    try:
+        ws = await SandboxContainerManager.create_and_start(ws)
+    except ImageNotFoundError as e:
+        raise ValidationError(reason=f"镜像 {e.image} 在本地不存在，请先在概览页拉取镜像后再启动容器")
+    await publish_system_event(WorkspaceStatusEvent(
+        workspace_id=ws.id,
+        status=ws.status,  # type: ignore[arg-type]
+        name=ws.name,
+        container_name=ws.container_name,
+        host_port=ws.host_port,
+    ))
+    return await _detail_async(ws)
 
 
 @router.post("/{workspace_id}/sandbox/stop", summary="停止沙盒容器", response_model=ActionOkResponse)
@@ -312,6 +436,14 @@ async def stop_sandbox(
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
     await SandboxContainerManager.stop(ws)
+    await ws.refresh_from_db()
+    await publish_system_event(WorkspaceStatusEvent(
+        workspace_id=ws.id,
+        status=ws.status,  # type: ignore[arg-type]
+        name=ws.name,
+        container_name=ws.container_name,
+        host_port=ws.host_port,
+    ))
     return ActionOkResponse(ok=True)
 
 
@@ -327,6 +459,15 @@ async def restart_sandbox(
     if not ws.container_name:
         raise ValidationError(reason="工作区尚无运行中的容器")
     await SandboxContainerManager.restart(ws)
+    # restart() 内部会在健康检查失败时修改 status，需要重新查询
+    await ws.refresh_from_db()
+    await publish_system_event(WorkspaceStatusEvent(
+        workspace_id=ws.id,
+        status=ws.status,  # type: ignore[arg-type]
+        name=ws.name,
+        container_name=ws.container_name,
+        host_port=ws.host_port,
+    ))
     return ActionOkResponse(ok=True)
 
 
@@ -339,8 +480,98 @@ async def rebuild_sandbox(
     ws = await DBWorkspace.get_or_none(id=workspace_id)
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
-    ws = await SandboxContainerManager.rebuild(ws)
-    return _detail(ws)
+    try:
+        ws = await SandboxContainerManager.rebuild(ws)
+    except ImageNotFoundError as e:
+        raise ValidationError(reason=f"镜像 {e.image} 在本地不存在，请先在概览页拉取镜像后再重建容器")
+    await publish_system_event(WorkspaceStatusEvent(
+        workspace_id=ws.id,
+        status=ws.status,  # type: ignore[arg-type]
+        name=ws.name,
+        container_name=ws.container_name,
+        host_port=ws.host_port,
+    ))
+    return await _detail_async(ws)
+
+
+# ─────────────────────────────────────────────────────────────
+# 沙盒镜像管理
+# ─────────────────────────────────────────────────────────────
+
+
+class ImageCheckResponse(BaseModel):
+    image: str
+    exists: bool
+
+
+@router.get("/{workspace_id}/sandbox/image/check", summary="检查沙盒镜像是否存在", response_model=ImageCheckResponse)
+@require_role(Role.Admin)
+async def check_sandbox_image(
+    workspace_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ImageCheckResponse:
+    from nekro_agent.core.config import config as app_config
+
+    ws = await DBWorkspace.get_or_none(id=workspace_id)
+    if not ws:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    image_name = ws.sandbox_image or app_config.CC_SANDBOX_IMAGE
+    image_tag = ws.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG
+    image = f"{image_name}:{image_tag}"
+    exists = await SandboxContainerManager.check_image_exists(image)
+    return ImageCheckResponse(image=image, exists=exists)
+
+
+@router.post("/{workspace_id}/sandbox/image/pull/stream", summary="拉取沙盒镜像（SSE 流式进度）")
+@require_role(Role.Admin)
+async def pull_sandbox_image_stream(
+    workspace_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> EventSourceResponse:
+    from nekro_agent.core.config import config as app_config
+
+    ws = await DBWorkspace.get_or_none(id=workspace_id)
+    if not ws:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    image_name = ws.sandbox_image or app_config.CC_SANDBOX_IMAGE
+    image_tag = ws.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG
+    image = f"{image_name}:{image_tag}"
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        docker = aiodocker.Docker()
+        # 记录每个 layer 当前状态，避免重复推送相同状态
+        layer_status: dict[str, str] = {}
+        # 需要立即推送的终态/关键状态
+        _TERMINAL_STATUSES = {"Pull complete", "Already exists", "Download complete", "Verifying Checksum"}
+        try:
+            async for progress in docker.images.pull(image, stream=True):
+                if not isinstance(progress, dict):
+                    continue
+                status: str = progress.get("status", "")
+                layer_id: str = progress.get("id", "")
+                # 无 layer ID 的全局消息（Digest、Status）直接推送
+                if not layer_id:
+                    if status:
+                        yield json.dumps({"type": "progress", "layer": "", "status": status})
+                    continue
+                prev = layer_status.get(layer_id)
+                # 状态未变化且不是终态，跳过
+                if prev == status and status not in _TERMINAL_STATUSES:
+                    continue
+                layer_status[layer_id] = status
+                yield json.dumps({"type": "progress", "layer": layer_id, "status": status})
+            yield json.dumps({"type": "done", "data": f"镜像 {image} 拉取完成"})
+        except aiodocker.exceptions.DockerError as e:
+            yield json.dumps({"type": "error", "data": f"拉取失败：{e}"})
+        except Exception as e:
+            yield json.dumps({"type": "error", "data": f"拉取异常：{e}"})
+        finally:
+            try:
+                await docker.close()
+            except Exception:
+                pass
+
+    return EventSourceResponse(event_generator())
 
 
 @router.get("/{workspace_id}/sandbox/status", summary="获取沙盒状态", response_model=SandboxStatus)
@@ -556,7 +787,7 @@ async def update_workspace_skills(
     return ActionOkResponse(ok=True)
 
 
-@router.post("/{workspace_id}/skills/{skill_name}/sync", summary="从全局库重新同步单个 skill", response_model=ActionOkResponse)
+@router.post("/{workspace_id}/skills/{skill_name:path}/sync", summary="从全局库重新同步单个 skill", response_model=ActionOkResponse)
 @require_role(Role.Admin)
 async def sync_workspace_skill(
     workspace_id: int,
@@ -566,7 +797,7 @@ async def sync_workspace_skill(
     ws = await DBWorkspace.get_or_none(id=workspace_id)
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
-    ok = await WorkspaceService.sync_single_user_skill(ws, skill_name)
+    ok = await WorkspaceService.sync_single_skill(ws, skill_name)
     if not ok:
         raise OperationFailedError(operation=f"同步技能 {skill_name}（未选中或源目录不存在）")
     return ActionOkResponse(ok=True)
@@ -736,21 +967,143 @@ async def delete_dynamic_skill(
     return ActionOkResponse(ok=True)
 
 
+class PromoteBody(BaseModel):
+    force: bool = False
+
+
 @router.post("/{workspace_id}/dynamic-skills/{dir_name}/promote", summary="晋升动态 skill 为全局用户 skill", response_model=ActionOkResponse)
 @require_role(Role.Admin)
 async def promote_dynamic_skill(
     workspace_id: int,
     dir_name: str,
+    body: Optional[PromoteBody] = None,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ActionOkResponse:
     ws = await DBWorkspace.get_or_none(id=workspace_id)
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
+    force = body.force if body else False
     try:
-        WorkspaceService.promote_dynamic_skill(workspace_id, dir_name)
+        WorkspaceService.promote_dynamic_skill(workspace_id, dir_name, force=force)
     except ValueError as e:
-        raise NotFoundError(resource=str(e)) from e
+        raise ValidationError(reason=str(e)) from e
     return ActionOkResponse(ok=True, message=f"已晋升 '{dir_name}' 为全局用户 skill")
+
+
+# ── 动态 skill 目录/文件浏览 ──────────────────────────────────
+
+
+class DynamicSkillDirEntry(BaseModel):
+    name: str
+    rel_path: str
+    type: Literal["file", "dir"]
+    size: Optional[int] = None
+
+
+class DynamicSkillDirResponse(BaseModel):
+    entries: List[DynamicSkillDirEntry]
+
+
+class DynamicSkillFileBody(BaseModel):
+    rel_path: str
+    content: str
+
+
+def _list_dynamic_dir(root: Any, current: Any, max_depth: int = 5) -> List[DynamicSkillDirEntry]:
+    """递归列出目录内所有文件和子目录（跳过 .git 等隐藏目录）"""
+    entries: List[DynamicSkillDirEntry] = []
+    if max_depth <= 0:
+        return entries
+    try:
+        items = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        return entries
+    for item in items:
+        if item.name.startswith("."):
+            continue
+        rel = str(item.relative_to(root))
+        if item.is_dir():
+            entries.append(DynamicSkillDirEntry(name=item.name, rel_path=rel, type="dir"))
+            entries.extend(_list_dynamic_dir(root, item, max_depth - 1))
+        elif item.is_file():
+            try:
+                size = item.stat().st_size
+            except OSError:
+                size = None
+            entries.append(DynamicSkillDirEntry(name=item.name, rel_path=rel, type="file", size=size))
+    return entries
+
+
+@router.get(
+    "/{workspace_id}/dynamic-skills/{dir_name}/dir",
+    summary="列出动态 skill 目录内所有文件",
+    response_model=DynamicSkillDirResponse,
+)
+@require_role(Role.Admin)
+async def list_dynamic_skill_dir(
+    workspace_id: int,
+    dir_name: str,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> DynamicSkillDirResponse:
+    ws = await DBWorkspace.get_or_none(id=workspace_id)
+    if not ws:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    skill_dir = WorkspaceService.get_dynamic_skills_dir(workspace_id) / dir_name
+    if not skill_dir.exists() or not skill_dir.is_dir():
+        raise NotFoundError(resource=f"动态 skill '{dir_name}'")
+    entries = await asyncio.to_thread(_list_dynamic_dir, skill_dir, skill_dir)
+    return DynamicSkillDirResponse(entries=entries)
+
+
+@router.get(
+    "/{workspace_id}/dynamic-skills/{dir_name}/file",
+    summary="读取动态 skill 目录内指定文件",
+    response_model=DynamicSkillContent,
+)
+@require_role(Role.Admin)
+async def get_dynamic_skill_file(
+    workspace_id: int,
+    dir_name: str,
+    rel_path: str = Query(..., description="相对于 skill 根目录的文件路径"),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> DynamicSkillContent:
+    ws = await DBWorkspace.get_or_none(id=workspace_id)
+    if not ws:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    if ".." in rel_path.split("/"):
+        raise ValidationError(reason="路径不合法")
+    skill_dir = WorkspaceService.get_dynamic_skills_dir(workspace_id) / dir_name
+    target = skill_dir / rel_path
+    if not target.exists() or not target.is_file():
+        raise NotFoundError(resource=f"文件 '{rel_path}'")
+    content = await asyncio.to_thread(target.read_text, "utf-8")
+    return DynamicSkillContent(dir_name=dir_name, content=content)
+
+
+@router.put(
+    "/{workspace_id}/dynamic-skills/{dir_name}/file",
+    summary="保存动态 skill 目录内指定文件",
+    response_model=ActionOkResponse,
+)
+@require_role(Role.Admin)
+async def save_dynamic_skill_file(
+    workspace_id: int,
+    dir_name: str,
+    body: DynamicSkillFileBody,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ActionOkResponse:
+    ws = await DBWorkspace.get_or_none(id=workspace_id)
+    if not ws:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    if ".." in body.rel_path.split("/"):
+        raise ValidationError(reason="路径不合法")
+    skill_dir = WorkspaceService.get_dynamic_skills_dir(workspace_id) / dir_name
+    if not skill_dir.exists() or not skill_dir.is_dir():
+        raise NotFoundError(resource=f"动态 skill '{dir_name}'")
+    target = skill_dir / body.rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(target.write_text, body.content, "utf-8")
+    return ActionOkResponse(ok=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -850,6 +1203,7 @@ async def get_workspace_cc_preset(
 @router.get("/{workspace_id}/sandbox/logs/stream", summary="流式推送容器日志")
 @require_role(Role.Admin)
 async def stream_sandbox_logs(
+    request: Request,
     workspace_id: int,
     tail: int = Query(default=200, ge=1, le=2000),
     _current_user: DBUser = Depends(get_current_active_user),
@@ -858,27 +1212,109 @@ async def stream_sandbox_logs(
     if not ws:
         raise NotFoundError(resource=f"工作区 {workspace_id}")
 
-    container_name = ws.container_name
+    # _SENTINEL 用于通知生成器日志 Task 已结束
+    _SENTINEL = object()
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        if not container_name:
-            yield json.dumps({"type": "info", "data": "[容器未运行，暂无日志]\n"})
-            return
-
+    async def _pump_docker_logs(
+        container_name: str,
+        current_tail: int,
+        queue: "asyncio.Queue[object]",
+    ) -> None:
+        """在独立 Task 中消费 Docker log stream，将数据写入 Queue。
+        Task 被取消时，aiodocker 的 async for 会收到 CancelledError 并退出。
+        """
         docker = aiodocker.Docker()
         try:
             container = await docker.containers.get(container_name)
-            async for chunk in container.log(stdout=True, stderr=True, follow=True, tail=tail):
-                yield json.dumps({"type": "log", "data": chunk})
+            async for chunk in container.log(stdout=True, stderr=True, follow=True, tail=current_tail):
+                await queue.put(json.dumps({"type": "log", "data": chunk}))
+        except asyncio.CancelledError:
+            raise
         except aiodocker.exceptions.DockerError as e:
-            yield json.dumps({"type": "error", "data": f"[Docker 错误: {e}]\n"})
+            err_msg = str(e)
+            if "No such container" in err_msg or "404" in err_msg:
+                await queue.put(json.dumps({"type": "info", "data": "[容器已被删除，等待重建...]\n"}))
+            else:
+                await queue.put(json.dumps({"type": "error", "data": f"[Docker 错误: {e}]\n"}))
         except Exception as e:
-            yield json.dumps({"type": "error", "data": f"[错误: {e}]\n"})
+            await queue.put(json.dumps({"type": "error", "data": f"[错误: {e}]\n"}))
         finally:
             try:
                 await docker.close()
             except Exception:
                 pass
+            # 通知消费方本次 Task 已结束
+            await queue.put(_SENTINEL)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        # 记录上一次跟踪的容器名，用于检测容器切换
+        last_container_name: Optional[str] = None
+        # 是否已提示过"等待容器"
+        waiting_notified = False
+        # 首次连接时使用 tail 参数，容器切换后从头跟踪新容器
+        current_tail = tail
+
+        while True:
+            # 检查客户端是否已断开
+            if await request.is_disconnected():
+                return
+
+            # 每次循环都重新查询数据库，获取最新容器名
+            ws_current = await DBWorkspace.get_or_none(id=workspace_id)
+            if not ws_current:
+                yield json.dumps({"type": "error", "data": "[工作区已不存在，日志流终止]\n"})
+                return
+
+            current_container = ws_current.container_name
+
+            if not current_container:
+                # 容器不存在（可能正在重建），等待并提示
+                if not waiting_notified:
+                    msg = "[容器正在重建，等待新容器启动...]\n" if last_container_name is not None else "[容器未运行，等待启动...]\n"
+                    yield json.dumps({"type": "info", "data": msg})
+                    waiting_notified = True
+                    last_container_name = None
+                await asyncio.sleep(2)
+                continue
+
+            waiting_notified = False  # 容器出现后重置提示标志
+
+            if current_container != last_container_name:
+                # 检测到新容器（首次或切换），提示用户
+                if last_container_name is not None:
+                    yield json.dumps({"type": "info", "data": f"[检测到新容器 {current_container}，开始跟踪日志...]\n"})
+                    current_tail = 50  # 新容器只取最近 50 行，避免刷屏
+                last_container_name = current_container
+
+            # 启动独立 Task 消费 Docker log stream，通过 Queue 传递数据
+            queue: asyncio.Queue[object] = asyncio.Queue(maxsize=256)
+            log_task = asyncio.create_task(_pump_docker_logs(current_container, current_tail, queue))
+            try:
+                while True:
+                    # 检查客户端是否已断开
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    if item is _SENTINEL:
+                        # Task 正常结束（容器停止）
+                        break
+                    yield str(item)
+            finally:
+                # 无论何种退出原因（断连、CancelledError、正常结束）都取消 Task
+                if not log_task.done():
+                    log_task.cancel()
+                    try:
+                        await log_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+            # 容器停止后等待重启
+            yield json.dumps({"type": "info", "data": "[容器已停止，等待重启...]\n"})
+            last_container_name = None
+            await asyncio.sleep(2)
 
     return EventSourceResponse(event_generator())
 
@@ -910,8 +1346,8 @@ async def workspace_terminal(
     # 设置初始终端大小
     fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
 
-    # 尝试 bash，不存在则用 sh
-    shell_cmd = ["docker", "exec", "-it", ws_db.container_name, "/bin/bash"]
+    # 尝试 bash，不存在则用 sh；-w 指定初始工作目录为工作区目录
+    shell_cmd = ["docker", "exec", "-it", "-w", "/workspace/default", ws_db.container_name, "/bin/bash"]
     proc = subprocess.Popen(
         shell_cmd,
         stdin=slave_fd,
@@ -1148,6 +1584,7 @@ def _comm_log_to_dict(log: Any) -> dict:
 @router.get("/{workspace_id}/comm/stream", summary="实时推送沙盒通讯事件（SSE）")
 @require_role(Role.Admin)
 async def stream_comm_log(
+    request: Request,
     workspace_id: int,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> EventSourceResponse:
@@ -1161,6 +1598,8 @@ async def stream_comm_log(
         q = comm_broadcast.subscribe(workspace_id)
         try:
             while True:
+                if await request.is_disconnected():
+                    return
                 try:
                     payload = await asyncio.wait_for(q.get(), timeout=20.0)
                     yield payload

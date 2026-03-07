@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from nekro_agent.core.logger import get_sub_logger
-from nekro_agent.core.os_env import BUILTIN_SKILLS_SOURCE_DIR, SKILLS_DIR, WORKSPACE_ROOT_DIR
+from nekro_agent.core.os_env import BUILTIN_SKILLS_SOURCE_DIR, SKILLS_LOCAL_DIR, SKILLS_REPOS_DIR, WORKSPACE_ROOT_DIR
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_workspace import DBWorkspace
+from nekro_agent.schemas.workspace import ChannelAnnotation as ChannelAnnotationData
 
 if TYPE_CHECKING:
     from nekro_agent.core.cc_model_presets import CCModelPresetItem
@@ -119,15 +120,26 @@ updated: "YYYY-MM-DD"
 正文内容（Markdown 格式）
 ```
 
-**关于 `_na_context.md`**：
-这是 NA 主 Agent 的"情报简报"，字数控制在 600 字（约 1800 字符）以内。
-请在完成重要任务后主动更新它，说明：当前项目状态、关键约束、NA 应该知道的事项。
+**关于 `_na_context.md`（强制维护）**：
+这是 NA 主 Agent 的"情报简报"，NA 在每次与用户交互时都会读取此文件注入自身上下文。
+**每次任务完成后，无论任务是否"重要"，你都必须更新此文件。** 这不是可选项。
+
+更新要求：
+- **字数**：600 字以内（约 1800 字符），保持简洁
+- **格式**：使用 YAML frontmatter，`updated` 字段记录当前日期（`YYYY-MM-DD`）
+- **必须包含**：
+  1. 工作区当前状态概要（活跃项目、主要目录结构、技术栈）
+  2. 最近完成的任务摘要（做了什么、结果如何）
+  3. 当前进行中的任务或待办事项（如有）
+  4. 重要约束与注意事项（已知问题、特殊配置、踩坑记录）
+
+**不更新的后果**：NA 将无法感知工作区状态，可能给出错误的指令或重复执行已完成的工作。
 
 ## 与 NA 的协作协议
 
 1. **任务接收**：你收到的消息已经过 NA 预处理和上下文注入
 2. **结果汇报**：任务完成后，在响应末尾附加简短执行摘要（文件路径、关键结论、注意事项）
-3. **异常上报**：遇到无法自行解决的问题时，明确说明原因，不要静默失败
+3. **异常上报**：遇到无法自行解决的问题时，明确说明原因，禁止静默失败
 4. **澄清反馈**：当任务描述模糊、包含不存在的文件/函数/路径、或与工作区实际状态明显矛盾时，**不要猜测执行**，而是在响应中列出具体的澄清问题（NA 会转达给人类用户）。格式示例：
    ```
    [需要澄清]
@@ -135,8 +147,9 @@ updated: "YYYY-MM-DD"
    - "优化性能"的具体目标是？（减少内存？降低延迟？）
    ```
 5. **自主调整**：当 NA 给出的实现思路与工作区实际情况不符时，你可以基于现实调整方案，并在响应中说明"原计划 X，实际按 Y 执行，原因：Z"
-6. **记忆更新**：完成对后续任务有参考价值的工作后，及时更新相应的记忆文件
+6. **记忆更新（强制）**：每次任务完成后，**必须**更新 `_na_context.md`（见上方说明），同时按需更新其他记忆文件
 7. **任务来源**：每条任务消息头部可能包含 `[任务来源频道: <chat_key>]` 标记，标识该任务来自哪个 NA 会话频道。在多频道共用同一工作区场景下，可利用此信息在记忆文件中区分不同频道的任务背景。
+8. **态度认真**：对于来自 NA 的任何指示，必须进行足够深入的分析、思考与研究，时刻思考**我是否真的高质量地完成了任务?**，严禁敷衍了事！
 
 {env_vars_section}
 {extra_section}"""
@@ -585,15 +598,39 @@ updated: "YYYY-MM-DD"
             return None
 
     @staticmethod
+    def _resolve_skill_source(skill_id: str) -> "tuple[Optional[Path], str]":
+        """根据 skill_id 解析源目录和类别。
+
+        Returns:
+            (source_dir, category): source_dir 为 None 表示未找到; category 为 "builtin"/"user"/"repo"
+        """
+        builtin_src = Path(BUILTIN_SKILLS_SOURCE_DIR)
+        local_src = Path(SKILLS_LOCAL_DIR)
+        repos_src = Path(SKILLS_REPOS_DIR)
+
+        if "/" in skill_id:
+            # 仓库技能：repos/{repo}/{skill}
+            src = repos_src / skill_id
+            return (src, "repo") if src.is_dir() else (None, "repo")
+
+        # 不含 / → 先 builtin，再 local
+        src = builtin_src / skill_id
+        if src.is_dir():
+            return src, "builtin"
+        src = local_src / skill_id
+        if src.is_dir():
+            return src, "user"
+        return None, "user"
+
+    @staticmethod
     async def sync_skills(workspace: DBWorkspace) -> None:
         """将 metadata['skills'] 中选中的技能同步到沙盒 .claude_home/skills/"""
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
         skills_home = ws_dir / ".claude_home" / "skills"
         skills_home.mkdir(parents=True, exist_ok=True)
 
-        builtin_src = Path(BUILTIN_SKILLS_SOURCE_DIR)
-        user_src = Path(SKILLS_DIR)
-        user_src.mkdir(parents=True, exist_ok=True)
+        Path(SKILLS_LOCAL_DIR).mkdir(parents=True, exist_ok=True)
+        Path(SKILLS_REPOS_DIR).mkdir(parents=True, exist_ok=True)
 
         builtin_dst = skills_home / "builtin"
         user_dst = skills_home / "user"
@@ -601,34 +638,40 @@ updated: "YYYY-MM-DD"
         user_dst.mkdir(exist_ok=True)
 
         selected_skills: List[str] = workspace.metadata.get("skills", [])
+        # 构建选中 skill 的目标目录名集合（仓库技能取最后一段）
+        selected_builtin_names: set[str] = set()
+        selected_user_names: set[str] = set()
+        for sid in selected_skills:
+            _, cat = WorkspaceService._resolve_skill_source(sid)
+            target_name = sid.split("/")[-1] if "/" in sid else sid
+            if cat == "builtin":
+                selected_builtin_names.add(target_name)
+            else:
+                selected_user_names.add(target_name)
 
-        # 清理 builtin_dst 中不在选中列表的
+        # 清理不在选中列表的
         for d in list(builtin_dst.iterdir()):
-            if d.is_dir() and d.name not in selected_skills:
+            if d.is_dir() and d.name not in selected_builtin_names:
                 shutil.rmtree(d)
                 logger.debug(f"清理内置 skill: {d.name}")
-
-        # 清理 user_dst 中不在选中列表的
         for d in list(user_dst.iterdir()):
-            if d.is_dir() and d.name not in selected_skills:
+            if d.is_dir() and d.name not in selected_user_names:
                 shutil.rmtree(d)
                 logger.debug(f"清理用户 skill: {d.name}")
 
         # 复制/更新选中的 skill
-        for skill_name in selected_skills:
-            src = builtin_src / skill_name
-            dst_parent = builtin_dst
-            if not src.is_dir():
-                src = user_src / skill_name
-                dst_parent = user_dst
-            if not src.is_dir():
-                logger.warning(f"skill 不存在（builtin 和 user 库均未找到）: {skill_name}")
+        for skill_id in selected_skills:
+            src, cat = WorkspaceService._resolve_skill_source(skill_id)
+            if src is None or not src.is_dir():
+                logger.warning(f"skill 不存在: {skill_id}")
                 continue
-            dst = dst_parent / skill_name
+            target_name = skill_id.split("/")[-1] if "/" in skill_id else skill_id
+            dst_parent = builtin_dst if cat == "builtin" else user_dst
+            dst = dst_parent / target_name
             if dst.exists():
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
-            logger.debug(f"同步 skill: {skill_name} → {dst_parent.name}/")
+            logger.debug(f"同步 skill: {skill_id} → {dst_parent.name}/{target_name}")
 
         # dynamic 目录仅确保存在，不做任何清理
         (skills_home / "dynamic").mkdir(exist_ok=True)
@@ -657,8 +700,8 @@ updated: "YYYY-MM-DD"
         await channel.save(update_fields=["workspace_id", "update_time"])
 
     @staticmethod
-    async def unbind_channel(chat_key: str) -> None:
-        """解除频道的工作区绑定"""
+    async def unbind_channel(workspace: DBWorkspace, chat_key: str) -> None:
+        """解除频道的工作区绑定，并同步清理工作区侧的频道注解。"""
         channel = await DBChatChannel.get_or_none(chat_key=chat_key)
         if channel is None:
             from nekro_agent.schemas.errors import NotFoundError
@@ -666,11 +709,91 @@ updated: "YYYY-MM-DD"
             raise NotFoundError(resource=f"频道 {chat_key}")
         channel.workspace_id = None  # type: ignore[assignment]
         await channel.save(update_fields=["workspace_id", "update_time"])
+        # 同步清理工作区侧注解
+        await WorkspaceService.remove_channel_annotation(workspace, chat_key)
 
     @staticmethod
     async def get_bound_channels(workspace_id: int) -> List[DBChatChannel]:
         """获取绑定到工作区的所有频道"""
         return await DBChatChannel.filter(workspace_id=workspace_id).all()
+
+    # ── 频道注解管理（存储于 metadata.channel_annotations） ───────────────────
+
+    @staticmethod
+    def get_channel_annotations(workspace: DBWorkspace) -> Dict[str, "ChannelAnnotationData"]:
+        """获取工作区所有频道注解，返回以 chat_key 为键的字典。"""
+        raw: Dict[str, Any] = workspace.metadata.get("channel_annotations", {})
+        result: Dict[str, ChannelAnnotationData] = {}
+        for chat_key, data in raw.items():
+            if isinstance(data, dict):
+                result[chat_key] = ChannelAnnotationData(
+                    description=str(data.get("description", "")),
+                    is_primary=bool(data.get("is_primary", False)),
+                )
+        return result
+
+    @staticmethod
+    def get_primary_channel_chat_key(workspace: DBWorkspace, bound_chat_keys: List[str]) -> Optional[str]:
+        """推断主频道 chat_key。
+        - 只有一个绑定频道时，直接返回它（无需显式设置）
+        - 多个频道时，从 annotations 中找 is_primary=True 的
+        """
+        if not bound_chat_keys:
+            return None
+        if len(bound_chat_keys) == 1:
+            return bound_chat_keys[0]
+        annotations = WorkspaceService.get_channel_annotations(workspace)
+        for chat_key in bound_chat_keys:
+            ann = annotations.get(chat_key)
+            if ann and ann.is_primary:
+                return chat_key
+        return None
+
+    @staticmethod
+    async def update_channel_annotation(
+        workspace: DBWorkspace,
+        chat_key: str,
+        description: str,
+        is_primary: bool,
+    ) -> None:
+        """更新单个频道的注解。若 is_primary=True，自动清除其他频道的主频道标记。"""
+        metadata = dict(workspace.metadata)
+        annotations: Dict[str, Any] = dict(metadata.get("channel_annotations", {}))
+
+        if is_primary:
+            # 清除其他频道的 is_primary
+            for key in annotations:
+                if key != chat_key and annotations[key].get("is_primary"):
+                    annotations[key] = dict(annotations[key])
+                    annotations[key]["is_primary"] = False
+
+        annotations[chat_key] = {
+            "description": description,
+            "is_primary": is_primary,
+        }
+
+        metadata["channel_annotations"] = annotations
+        workspace.metadata = metadata
+        await workspace.save(update_fields=["metadata", "update_time"])
+
+    @staticmethod
+    async def remove_channel_annotation(workspace: DBWorkspace, chat_key: str) -> None:
+        """删除频道注解（解绑时调用）。若被删除的是主频道且还有其他频道，自动将剩余第一个设为主频道。"""
+        metadata = dict(workspace.metadata)
+        annotations: Dict[str, Any] = dict(metadata.get("channel_annotations", {}))
+
+        was_primary = annotations.get(chat_key, {}).get("is_primary", False)
+        annotations.pop(chat_key, None)
+
+        # 若删除的是主频道，且还有其他注解，将第一个设为主频道
+        if was_primary and annotations:
+            first_key = next(iter(annotations))
+            annotations[first_key] = dict(annotations[first_key])
+            annotations[first_key]["is_primary"] = True
+
+        metadata["channel_annotations"] = annotations
+        workspace.metadata = metadata
+        await workspace.save(update_fields=["metadata", "update_time"])
 
     @staticmethod
     def get_dynamic_skills_dir(workspace_id: int) -> Path:
@@ -723,16 +846,46 @@ updated: "YYYY-MM-DD"
         return True
 
     @staticmethod
-    def promote_dynamic_skill(workspace_id: int, dir_name: str) -> str:
-        """将动态 skill 晋升为全局用户 skill（复制到 SKILLS_DIR），返回目录名"""
+    def promote_dynamic_skill(workspace_id: int, dir_name: str, *, force: bool = False) -> str:
+        """将动态 skill 晋升为全局用户 skill（复制到 SKILLS_LOCAL_DIR）。
+
+        Args:
+            force: 为 True 时覆盖已有同名技能，否则已存在时抛出 ConflictError。
+
+        Returns:
+            目录名
+
+        Raises:
+            ValueError: 源不存在或一致性校验失败
+            ConflictError: 目标已存在且 force=False
+        """
         src = WorkspaceService.get_dynamic_skills_dir(workspace_id) / dir_name
         if not src.exists() or not src.is_dir():
             raise ValueError(f"动态 skill 不存在: {dir_name}")
-        dst = Path(SKILLS_DIR) / dir_name
-        Path(SKILLS_DIR).mkdir(parents=True, exist_ok=True)
+
+        # 一致性校验：frontmatter name 必须与 dir_name 一致
+        meta = WorkspaceService._read_skill_meta(src)
+        if meta:
+            fm_name = meta.get("name", "")
+            if fm_name and fm_name != dir_name:
+                raise ValueError(
+                    f"SKILL.md 中的 name '{fm_name}' 与目录名 '{dir_name}' 不一致，请修正后重试"
+                )
+
+        dst = Path(SKILLS_LOCAL_DIR) / dir_name
+        Path(SKILLS_LOCAL_DIR).mkdir(parents=True, exist_ok=True)
+
+        if dst.exists() and not force:
+            from nekro_agent.schemas.errors import ConflictError
+            raise ConflictError(resource=f"技能 '{dir_name}' 已存在于技能库中")
+
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
+
+        # 写入 .skill-origin.json
+        WorkspaceService._write_skill_origin(dst, origin="promoted", promoted_from_workspace=workspace_id)
+
         return dir_name
 
     @staticmethod
@@ -753,12 +906,12 @@ updated: "YYYY-MM-DD"
 
     @staticmethod
     def list_global_skills() -> List[Dict[str, str]]:
-        """列出全局用户 skill 资源库（仅含有 SKILL.md 的目录）"""
-        global_skills_dir = Path(SKILLS_DIR)
-        global_skills_dir.mkdir(parents=True, exist_ok=True)
+        """列出全局用户 skill 资源库（仅 local/ 下含有 SKILL.md 的目录）"""
+        local_dir = Path(SKILLS_LOCAL_DIR)
+        local_dir.mkdir(parents=True, exist_ok=True)
         skills: List[Dict[str, str]] = []
-        for skill_dir in sorted(global_skills_dir.iterdir()):
-            if not skill_dir.is_dir():
+        for skill_dir in sorted(local_dir.iterdir()):
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             meta = WorkspaceService._read_skill_meta(skill_dir)
             if meta is None:
@@ -767,12 +920,40 @@ updated: "YYYY-MM-DD"
         return skills
 
     @staticmethod
+    def _scan_repo_skills(repos_dir: Path) -> List[Dict[str, str]]:
+        """递归扫描 repos/ 下所有含 SKILL.md 的目录，返回统一格式列表。
+
+        标识格式：repo_name/skill_dir_name
+        """
+        results: List[Dict[str, str]] = []
+        if not repos_dir.exists():
+            return results
+        for repo_dir in sorted(repos_dir.iterdir()):
+            if not repo_dir.is_dir() or repo_dir.name.startswith("."):
+                continue
+            repo_name = repo_dir.name
+            for skill_dir in sorted(repo_dir.iterdir()):
+                if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                    continue
+                meta = WorkspaceService._read_skill_meta(skill_dir)
+                if meta is None:
+                    continue
+                results.append({
+                    "name": f"{repo_name}/{skill_dir.name}",
+                    "display_name": meta["name"],
+                    "description": meta["description"],
+                    "source": "repo",
+                    "repo_name": repo_name,
+                })
+        return results
+
+    @staticmethod
     def list_all_skills() -> List[Dict[str, str]]:
-        """列出所有可用技能候选（内置 + 用户技能库），每项含 source 字段（'builtin' 或 'user'）"""
-        seen: set = set()
+        """列出所有可用技能候选（内置 + local + repos），每项含 source 字段"""
+        seen: set[str] = set()
         result: List[Dict[str, str]] = []
 
-        # 优先列出内置
+        # 1. 内置
         builtin_src = Path(BUILTIN_SKILLS_SOURCE_DIR)
         if builtin_src.exists():
             for skill_dir in sorted(builtin_src.iterdir()):
@@ -789,10 +970,10 @@ updated: "YYYY-MM-DD"
                 })
                 seen.add(skill_dir.name)
 
-        # 再列出用户库（跳过与内置同名的）
-        user_src = Path(SKILLS_DIR)
-        user_src.mkdir(parents=True, exist_ok=True)
-        for skill_dir in sorted(user_src.iterdir()):
+        # 2. local（跳过与内置同名的）
+        local_src = Path(SKILLS_LOCAL_DIR)
+        local_src.mkdir(parents=True, exist_ok=True)
+        for skill_dir in sorted(local_src.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             if skill_dir.name in seen:
@@ -806,25 +987,81 @@ updated: "YYYY-MM-DD"
                 "description": meta["description"],
                 "source": "user",
             })
+            seen.add(skill_dir.name)
+
+        # 3. repos（嵌套，标识含 /）
+        repos_src = Path(SKILLS_REPOS_DIR)
+        repos_src.mkdir(parents=True, exist_ok=True)
+        result.extend(WorkspaceService._scan_repo_skills(repos_src))
 
         return result
 
     @staticmethod
-    async def sync_single_user_skill(workspace: "DBWorkspace", skill_name: str) -> bool:
-        """从全局 skill 库重新同步单个用户 skill 到工作区（不修改选中列表）。返回是否成功。"""
+    async def sync_single_skill(workspace: "DBWorkspace", skill_id: str) -> bool:
+        """从全局 skill 库重新同步单个 skill 到工作区（不修改选中列表）。
+
+        支持 builtin/local/repo 三种来源，skill_id 可含 / (仓库技能)。
+        """
         selected_skills: List[str] = workspace.metadata.get("skills", [])
-        if skill_name not in selected_skills:
+        if skill_id not in selected_skills:
+            return False
+        src, cat = WorkspaceService._resolve_skill_source(skill_id)
+        if src is None or not src.is_dir():
+            logger.warning(f"全局 skill 不存在，无法同步: {skill_id}")
             return False
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
-        user_dst = ws_dir / ".claude_home" / "skills" / "user"
-        user_dst.mkdir(parents=True, exist_ok=True)
-        src = Path(SKILLS_DIR) / skill_name
-        dst = user_dst / skill_name
-        if not src.exists() or not src.is_dir():
-            logger.warning(f"全局 skill 不存在，无法同步: {skill_name}")
-            return False
+        target_name = skill_id.split("/")[-1] if "/" in skill_id else skill_id
+        dst_parent = ws_dir / ".claude_home" / "skills" / ("builtin" if cat == "builtin" else "user")
+        dst_parent.mkdir(parents=True, exist_ok=True)
+        dst = dst_parent / target_name
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
-        logger.debug(f"重新同步用户 skill: {skill_name}")
+        logger.debug(f"重新同步 skill: {skill_id} → {dst_parent.name}/{target_name}")
         return True
+
+    @staticmethod
+    def _write_skill_origin(
+        skill_dir: Path,
+        *,
+        origin: str,
+        promoted_from_workspace: Optional[int] = None,
+        repo_url: Optional[str] = None,
+        community_id: Optional[str] = None,
+        community_slug: Optional[str] = None,
+    ) -> None:
+        """在 skill 目录下写入 .skill-origin.json 来源追溯文件。"""
+        data = {
+            "origin": origin,
+            "promoted_from_workspace": promoted_from_workspace,
+            "repo_url": repo_url,
+            "community_id": community_id,
+            "community_slug": community_slug,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        origin_path = skill_dir / ".skill-origin.json"
+        origin_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def read_skill_origin(skill_dir: Path) -> Optional[Dict[str, Any]]:
+        """读取 .skill-origin.json，不存在返回 None。"""
+        origin_path = skill_dir / ".skill-origin.json"
+        if not origin_path.exists():
+            return None
+        try:
+            return json.loads(origin_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    @staticmethod
+    async def sync_skill_to_all_workspaces(skill_id: str) -> int:
+        """将指定技能同步到所有引用它的工作区。返回同步成功的工作区数量。"""
+        workspaces = await DBWorkspace.all()
+        count = 0
+        for ws in workspaces:
+            selected: List[str] = ws.metadata.get("skills", [])
+            if skill_id in selected:
+                ok = await WorkspaceService.sync_single_skill(ws, skill_id)
+                if ok:
+                    count += 1
+        return count

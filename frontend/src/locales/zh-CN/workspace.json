@@ -27,6 +27,35 @@
     "empty": {
       "title": "暂无工作区",
       "hint": "点击「创建工作区」开始使用"
+    },
+    "batchSelect": "批量选择",
+    "selectAll": "全选",
+    "deselectAll": "取消全选",
+    "batchBar": {
+      "selected": "已选 {{count}} 个",
+      "cancel": "取消",
+      "start": "启动",
+      "stop": "停止",
+      "restart": "重启",
+      "rebuild": "重建",
+      "resetSession": "重置会话",
+      "setPreset": "设置模型组"
+    },
+    "batchConfirm": {
+      "title": "确认批量操作",
+      "content": "确认对选中的 {{count}} 个工作区执行「{{op}}」操作？",
+      "cancel": "取消",
+      "confirm": "确认"
+    },
+    "batchPreset": {
+      "title": "批量设置 CC 模型组",
+      "hint": "将对选中的 {{count}} 个工作区设置相同的 CC 模型组。选择「清空」可移除现有绑定。",
+      "selectLabel": "CC 模型组",
+      "clearHint": "留空以清除绑定",
+      "noPresets": "暂无可用模型组",
+      "cancel": "取消",
+      "confirm": "应用",
+      "success": "已成功更新 {{count}} 个工作区的模型组"
     }
   },
   "card": {
@@ -36,7 +65,12 @@
     "container": "容器",
     "createdAt": "创建",
     "enter": "进入",
-    "delete": "删除"
+    "delete": "删除",
+    "channels": "频道",
+    "channelMore": "等{{n}}个",
+    "model": "模型",
+    "skillMcp": "Skill/MCP",
+    "ccActive": "CC 执行中"
   },
   "createDialog": {
     "title": "创建工作区",
@@ -123,30 +157,32 @@
     }
   },
   "skills": {
-    "tabs": {
-      "user": "用户技能库",
-      "builtin": "内置技能",
-      "builtinWithCount": "内置技能（{{count}}）"
-    },
-    "stats": {
-      "filtered": "{{filtered}} / {{total}} 个技能",
-      "total": "共 {{total}} 个技能"
-    },
+    "pageTitle": "技能库",
+    "pageDesc": "管理 Claude Code 可用的技能，标记自动注入的技能将在新建工作区时自动启用",
+    "statBuiltin": "内置技能",
+    "statUser": "用户技能",
+    "statRepo": "仓库技能",
+    "statAutoInject": "自动注入",
     "search": {
-      "placeholder": "搜索技能..."
+      "placeholder": "搜索技能名称或描述..."
+    },
+    "filter": {
+      "all": "全部",
+      "builtin": "内置",
+      "user": "用户",
+      "repo": "仓库"
     },
     "toolbar": {
-      "treeView": "目录树视图",
-      "flatView": "平铺视图",
+      "cardView": "卡片视图",
+      "listView": "列表视图",
       "refresh": "刷新",
       "uploadTooltip": "上传 Skill（.zip 格式）",
-      "uploadBtn": "上传 ZIP",
+      "uploadBtn": "上传",
       "addBtn": "添加 Skill"
     },
     "empty": {
-      "title": "Skills 库为空",
-      "hint": "点击「添加 Skill」从 git 仓库克隆，或「上传 ZIP」添加本地包",
-      "noBuiltin": "暂无内置技能",
+      "title": "技能库为空",
+      "hint": "点击「添加 Skill」从 Git 仓库克隆，或上传 ZIP 包",
       "noMatch": "没有匹配的技能"
     },
     "content": {
@@ -154,16 +190,51 @@
       "allowedTools": "允许工具:",
       "loading": "加载中..."
     },
-    "nodeRow": {
-      "pullTooltip": "拉取更新",
-      "deleteTooltip": "删除"
+    "autoInject": {
+      "on": "自动注入",
+      "off": "非自动注入",
+      "tooltip": "开启后，新建工作区时将自动添加此技能",
+      "badge": "自动注入"
     },
     "card": {
-      "collapseTooltip": "收起",
-      "viewTooltip": "查看 SKILL.md"
+      "viewTooltip": "查看详情",
+      "deleteTooltip": "删除",
+      "pullTooltip": "拉取更新",
+      "sourceBuiltin": "内置",
+      "sourceUser": "用户",
+      "sourceRepo": "仓库"
+    },
+    "drawer": {
+      "title": "技能详情",
+      "close": "关闭",
+      "source": "来源",
+      "directory": "目录名",
+      "autoInject": "自动注入",
+      "syncToWorkspaces": "同步此技能到所有引用它的工作区",
+      "noContent": "暂无 SKILL.md 内容",
+      "files": "文件",
+      "preview": "预览",
+      "source_code": "源码",
+      "edit": "编辑",
+      "save": "保存",
+      "saving": "保存中...",
+      "cancel_edit": "取消",
+      "readOnly": "只读",
+      "modified": "已修改",
+      "saveSuccess": "文件已保存",
+      "saveFailed": "保存失败：{{message}}",
+      "loadFailed": "加载文件失败",
+      "binaryFile": "二进制文件，无法预览",
+      "emptyDir": "空目录",
+      "unsavedConfirm": "当前文件已修改，确定放弃更改吗？",
+      "unsavedTitle": "未保存的更改",
+      "discard": "放弃",
+      "keepEditing": "继续编辑",
+      "skillMd": "SKILL.md（主文件）",
+      "fileCount": "{{count}} 个文件"
     },
     "error": {
-      "loadFailed": "加载 Skills 库失败：{{message}}"
+      "loadFailed": "加载技能库失败：{{message}}"
     },
     "cloneDialog": {
       "title": "添加 Skill",
@@ -191,7 +262,11 @@
       "pullSuccess": "更新完成：{{output}}",
       "pullUpToDate": "已是最新",
       "pullFailed": "更新失败：{{message}}",
-      "invalidFile": "请选择 .zip 格式的文件"
+      "invalidFile": "请选择 .zip 格式的文件",
+      "autoInjectUpdated": "自动注入设置已更新",
+      "autoInjectFailed": "自动注入设置失败：{{message}}",
+      "syncSuccess": "已同步到 {{count}} 个工作区",
+      "syncFailed": "同步失败：{{message}}"
     }
   },
   "detail": {
@@ -261,7 +336,13 @@
         "bindSuccess": "频道已绑定",
         "bindFailed": "绑定失败：{{message}}",
         "unbindSuccess": "频道已解绑",
-        "unbindFailed": "解绑失败：{{message}}"
+        "unbindFailed": "解绑失败：{{message}}",
+        "annotationFailed": "注解更新失败：{{message}}",
+        "primaryTag": "主频道",
+        "setPrimaryTooltip": "设为主频道",
+        "isPrimaryTooltip": "当前主频道",
+        "primaryAutoTooltip": "单频道时自动作为主频道",
+        "descPlaceholder": "添加频道用途说明（可选）..."
       }
     },
     "sandbox": {
@@ -403,13 +484,18 @@
       "deployedEmpty": "暂未部署任何技能，点击「添加技能」从内置或技能库中挑选",
       "skillChipBuiltin": "内置",
       "skillChipUser": "技能库",
+      "skillChipRepo": "仓库",
       "skillChipPending": "待同步",
+      "skillChipAutoInject": "自动注入",
       "removeTooltip": "从已部署列表移除（点击「同步到沙盒」生效）",
       "ccCreatedLabel": "CC 创建（{{count}}）",
       "ccCreatedEmpty": "暂无动态技能",
       "skillChipCC": "CC创建",
+      "skillChipPromoted": "已晋升",
+      "viewDetailTooltip": "查看详情",
       "editSkillTooltip": "编辑 SKILL.md",
-      "promoteTooltip": "晋升为技能库",
+      "promoteTooltip": "晋升到技能库",
+      "updateLibraryTooltip": "更新到技能库",
       "deleteTooltip": "删除",
       "refreshDynamicTooltip": "刷新动态技能列表",
       "ccDesignBtn": "让 CC 设计新技能",
@@ -422,6 +508,7 @@
         "filterAll": "全部",
         "filterBuiltin": "内置",
         "filterUser": "技能库",
+        "filterRepo": "仓库",
         "allAdded": "所有技能均已添加",
         "noMatch": "无匹配结果",
         "selectedCount": "已选 {{count}} 个",
@@ -459,15 +546,17 @@
         "syncFailed": "同步失败：{{message}}",
         "deleteDynamicSuccess": "动态技能 {{name}} 已删除",
         "deleteDynamicFailed": "删除失败：{{message}}",
-        "promoteSuccess": "动态技能 {{name}} 已晋升为用户技能",
+        "promoteSuccess": "动态技能 {{name}} 已晋升到技能库",
         "promoteFailed": "晋升失败：{{message}}",
+        "updateLibrarySuccess": "动态技能 {{name}} 已更新到技能库",
         "saveDynamicSuccess": "动态技能 {{name}} 已保存",
         "saveDynamicFailed": "保存失败：{{message}}",
         "loadContentFailed": "加载技能内容失败：{{message}}"
       }
     },
     "comm": {
-      "loadMoreHint": "向上滚动加载更多",
+      "loadMore": "加载更多历史消息",
+      "noMoreMessages": "已加载全部历史消息",
       "noRecords": "暂无通讯记录",
       "noRecordsHint": "NA 向 CC 发送任务时，记录将实时出现在此处",
       "inputPlaceholderMac": "输入提示词（↩ 发送，⇧↩ 换行）",
@@ -567,6 +656,27 @@
         "content": "确定要删除工作区 {{name}} 吗？此操作不可撤销。",
         "cancel": "取消",
         "delete": "删除"
+      }
+    },
+    "errors": {
+      "imageNotFound": "镜像不存在，请先在概览页拉取镜像",
+      "image": {
+        "checking": "检查中",
+        "ready": "已就绪",
+        "notPulled": "未拉取",
+          "pullDialog": {
+            "title": "拉取沙盒镜像",
+            "confirmTitle": "拉取沙盒镜像",
+            "confirmHint": "将从 Docker Hub 拉取以下镜像，首次拉取需要一定时间，请确认网络畅通：",
+            "cancel": "取消",
+            "image": "镜像",
+            "pulling": "正在拉取...",
+            "success": "拉取完成",
+            "failed": "拉取失败",
+            "close": "关闭",
+            "retry": "重试",
+            "pullBtn": "开始拉取"
+          }
       }
     }
   }
