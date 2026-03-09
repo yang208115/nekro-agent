@@ -20,6 +20,26 @@
     "enabled": "Developer mode enabled!",
     "disabled": "Developer mode disabled"
   },
+  "agentActivity": {
+    "title": "AI Responding",
+    "tooltipChatKey": "Channel ID",
+    "tooltipType": "Type",
+    "tooltipTypeGroup": "Group",
+    "tooltipTypePrivate": "Private",
+    "tooltipTypeUnknown": "Unknown",
+    "tooltipPreset": "Persona",
+    "tooltipElapsed": "Elapsed",
+    "tooltipElapsedSec": "{{s}}s",
+    "tooltipClickHint": "Click to open channel",
+    "tooltipNoPreset": "Default Persona"
+  },
+  "workspaceActivity": {
+    "tooltipId": "Workspace ID",
+    "tooltipContainer": "Container"
+  },
+  "activity": {
+    "dismissHint": "Right-click to dismiss"
+  },
   "community": {
     "avatarTooltip": "Community Account",
     "visitCommunity": "Visit Community",

@@ -153,25 +153,63 @@ class MessageService:
     async def _run_chat_agent_task(self, chat_key: str, message: Optional[ChatMessage] = None, ctx: Optional[AgentCtx] = None):
         """执行agent任务"""
         from nekro_agent.services.agent.run_agent import run_agent
+        from nekro_agent.services.system_broadcast import AgentActiveEvent, publish_system_event
 
         adapter = await adapter_utils.get_adapter_for_chat(chat_key)
 
         logger.info(f"Message From {chat_key} is ToMe, Running Chat Agent...")
 
-        # 设置处理emoji
+        # 获取频道信息用于广播
+        db_channel = await DBChatChannel.get_channel(chat_key=chat_key)
+        preset = await db_channel.get_preset()
+        config = await db_channel.get_effective_config()
+        preset_id: Optional[int] = preset.id if hasattr(preset, "id") else None  # type: ignore[union-attr]
+        preset_name: Optional[str] = preset.name if hasattr(preset, "name") else None  # type: ignore[union-attr]
+
+        # 计算兜底总超时：每轮 LLM 超时 × (最大迭代次数 + 1) + 额外缓冲
+        # 防止底层 httpx/网络层超时失效时任务永久挂起占用频道锁
+        _per_round_timeout = (config.AI_GENERATE_TIMEOUT or 180) + 60  # 每轮预算（含 sandbox 执行缓冲）
+        _max_total_timeout = _per_round_timeout * (config.AI_SCRIPT_MAX_RETRY_TIMES + 1) * 3 + 120
+
+        # 广播 Agent 开始处理
+        try:
+            await publish_system_event(AgentActiveEvent(
+                chat_key=chat_key,
+                active=True,
+                channel_name=db_channel.channel_name,
+                chat_type=db_channel.channel_type,
+                preset_id=preset_id,
+                preset_name=preset_name,
+            ))
+        except Exception as _e:
+            logger.warning(f"[message_service] 广播 AgentActive 开始事件失败: {_e}")
+
+        # 设置处理emoji（Bot 已断开时可能抛 RuntimeError，仅记录后继续执行）
         if message and adapter.config.SESSION_PROCESSING_WITH_EMOJI and message.message_id:
-            await adapter.set_message_reaction(message.message_id, True)
+            try:
+                await adapter.set_message_reaction(message.message_id, True)
+            except RuntimeError as _e:
+                if "No OneBot V11 bot instance found" in str(_e):
+                    logger.warning(f"[message_service] 设置 emoji 时 Bot 未连接: {_e}")
+                else:
+                    raise
 
         try:
-            for _i in range(3):
-                try:
-                    await run_agent(chat_key=chat_key, chat_message=message, ctx=ctx)
-                except Exception as e:
-                    logger.exception(f"执行失败: {e}")
-                else:
-                    break
-            else:
-                logger.error("Failed to Run Chat Agent.")
+            try:
+                async with asyncio.timeout(_max_total_timeout):
+                    for _i in range(3):
+                        try:
+                            await run_agent(chat_key=chat_key, chat_message=message, ctx=ctx)
+                        except Exception as e:
+                            logger.exception(f"执行失败: {e}")
+                        else:
+                            break
+                    else:
+                        logger.error("Failed to Run Chat Agent.")
+            except TimeoutError:
+                logger.error(
+                    f"[message_service] 频道 {chat_key} Agent 任务超过兜底超时 {_max_total_timeout}s，强制终止以释放频道锁"
+                )
         finally:
             # 清理任务状态
             if chat_key in self.running_tasks:
@@ -180,9 +218,29 @@ class MessageService:
             final_message = self.pending_messages.pop(chat_key, None)
             self.debounce_timers.pop(chat_key, None)
 
-            # 取消处理emoji（如果设置过）
+            # 取消处理emoji（如果设置过）；NapCat 断开时 get_bot() 可能抛 RuntimeError，不能影响后续清理
             if adapter.config.SESSION_PROCESSING_WITH_EMOJI and message and message.message_id:
-                await adapter.set_message_reaction(message.message_id, False)
+                try:
+                    await adapter.set_message_reaction(message.message_id, False)
+                except RuntimeError as _e:
+                    if "No OneBot V11 bot instance found" not in str(_e):
+                        raise
+                    logger.warning(f"[message_service] 取消 emoji 时 Bot 已断开: {_e}")
+                except Exception as _e:
+                    logger.warning(f"[message_service] 取消 emoji 失败: {_e}")
+
+            # 广播 Agent 处理结束
+            try:
+                await publish_system_event(AgentActiveEvent(
+                    chat_key=chat_key,
+                    active=False,
+                    channel_name=db_channel.channel_name,
+                    chat_type=db_channel.channel_type,
+                    preset_id=preset_id,
+                    preset_name=preset_name,
+                ))
+            except Exception as _e:
+                logger.warning(f"[message_service] 广播 AgentActive 结束事件失败: {_e}")
 
             # 如果有待处理消息，创建新的任务处理最后一条消息
             if final_message:
